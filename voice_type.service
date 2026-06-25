@@ -1,0 +1,18 @@
+[Unit]
+Description=Voice Type Dictation Daemon
+After=pipewire.service wireplumber.service ydotool.service graphical-session.target
+Wants=pipewire.service wireplumber.service ydotool.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/home/rai/venv/bin/python /home/rai/Scripts/voice_type.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Exec=/home/rai/Scripts/voice_type_toggle.sh
+Name=Toggle Voice Dictation
+NoDisplay=true
+Type=Application
+StartupNotify=false
+X-KDE-StartupNotify=false
+X-KDE-GlobalAccel-CommandShortcut=true
+X-KDE-Shortcuts=Meta+X
+Icon=audio-input-microphone
