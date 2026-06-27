@@ -468,51 +468,6 @@ HALLUCINATION_BLOCKLIST = {
 }
 
 # ------------------------------------------------------------------------------
-# GNOME Custom Shortcut Auto-Installer
-# ------------------------------------------------------------------------------
-def install_gnome_shortcut():
-    print(f"Registering GNOME custom shortcut for {HOTKEY}...")
-    path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
-    cmd_name = f"gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{path} "
-    
-    script_path = os.path.abspath(__file__)
-    python_path = sys.executable
-    command_str = f"'{python_path} {script_path} --toggle'"
-    
-    try:
-        subprocess.run(f"{cmd_name} name \"'Toggle Voice Dictation'\"", shell=True, check=True, timeout=5.0)
-        subprocess.run(f"{cmd_name} command \"{command_str}\"", shell=True, check=True, timeout=5.0)
-        subprocess.run(f"{cmd_name} binding \"'{HOTKEY}'\"", shell=True, check=True, timeout=5.0)
-        
-        # Query existing custom keybindings
-        res = subprocess.run(
-            ["gsettings", "get", "org.gnome.settings-daemon.plugins.media-keys", "custom-keybindings"],
-            capture_output=True, text=True, check=True, timeout=5.0
-        )
-        current = res.stdout.strip()
-        
-        if path not in current:
-            if current == "@as []" or current == "[]":
-                new_list = f"['{path}']"
-            else:
-                items = current.strip("[]").replace("'", "").split(", ")
-                items.append(path)
-                new_list = "[" + ", ".join(f"'{i.strip()}'" for i in items if i.strip()) + "]"
-            
-            subprocess.run(
-                ["gsettings", "set", "org.gnome.settings-daemon.plugins.media-keys", "custom-keybindings", new_list],
-                check=True, timeout=5.0
-            )
-        print(f"GNOME global shortcut successfully registered to {HOTKEY}!")
-        print("Mutter compositor will exclusively capture this key; it will never leak to apps.")
-    except Exception as e:
-        print(f"Error registering GNOME shortcut: {e}", file=sys.stderr)
-
-if "--install-shortcut" in sys.argv:
-    install_gnome_shortcut()
-    sys.exit(0)
-
-# ------------------------------------------------------------------------------
 # Audio Feedback & Desktop Notifications
 # ------------------------------------------------------------------------------
 def play_sound(sound_name):
@@ -603,6 +558,8 @@ def show_notification_with_action(title, message, text_to_copy, icon="audio-inpu
 # ------------------------------------------------------------------------------
 # Text Injection Logic (Releases modifier keys to prevent shortcut conflicts)
 # ------------------------------------------------------------------------------
+import shutil
+
 def get_konsole_paste_shortcut():
     paths = [
         os.path.expanduser("~/.var/app/org.kde.konsole/config/konsolerc"),
@@ -622,8 +579,44 @@ def get_konsole_paste_shortcut():
                 print(f"[inject_text] Error reading config {path}: {e}", file=sys.stderr)
     return "ctrl+shift+v"
 
-def activate_window_by_uuid(uuid):
-    print(f"[focus] activate_window_by_uuid ({uuid}) - DISABLED (SKELETON)")
+def is_active_window_terminal():
+    """Detect if the currently active window is a terminal using KWin DBus (KDE Wayland/X11)."""
+    try:
+        # Ask KWin for the active window class/resource name using its generic DBus interface
+        # Method: org.kde.KWin.activeWindow
+        # This approach works best on Plasma 6 but we'll use a safer fallback via qdbus
+        res = subprocess.run(
+            ["qdbus", "org.kde.KWin", "/KWin", "org.kde.KWin.activeWindow"],
+            capture_output=True, text=True, timeout=1.0
+        )
+        if res.returncode != 0:
+            return False
+
+        # In newer KDE, we can query activeWindow.
+        # Otherwise, try kdotool if available.
+        kdotool_bin = shutil.which("kdotool") or (
+            os.path.expanduser("~/.local/bin/kdotool")
+            if os.path.exists(os.path.expanduser("~/.local/bin/kdotool"))
+            else None
+        )
+
+        active_class = ""
+        if kdotool_bin:
+            res_kdo = subprocess.run([kdotool_bin, "getactivewindow", "getwindowclassname"], capture_output=True, text=True, timeout=1.0)
+            if res_kdo.returncode == 0:
+                active_class = res_kdo.stdout.strip().lower()
+
+        # If kdotool isn't available or fails, fall back to checking if Konsole/Alacritty/Kitty
+        # is the only window or checking process tree, but kdotool is the reliable way on Wayland.
+        terminal_classes = ["konsole", "alacritty", "kitty", "gnome-terminal", "wezterm", "xterm"]
+
+        if active_class in terminal_classes:
+            print(f"[inject_text] Active window is a terminal: {active_class}")
+            return True
+
+    except Exception as e:
+        print(f"[inject_text] Error detecting active window: {e}", file=sys.stderr)
+
     return False
 
 last_injected_text = ""
@@ -661,6 +654,10 @@ def inject_text(text, transcription_duration=None):
     restore_enabled = current_config.get("restore_clipboard", False)
     typing_mode = current_config.get("typing_mode", "clipboard")
 
+    old_clipboard = None
+    if restore_enabled:
+        old_clipboard = get_clipboard_content()
+
     # Always copy to clipboard first so text is safe even if insertion fails.
     # We do this unconditionally (regardless of auto_copy flag) so the
     # transcription is never lost.
@@ -683,12 +680,15 @@ def inject_text(text, transcription_duration=None):
 
     if not auto_paste:
         logger.info("[inject_text] Auto-paste disabled – transcription is in clipboard.")
+        if restore_enabled and old_clipboard is not None:
+            # Note: if auto_paste is disabled, we don't automatically restore the clipboard
+            # right away because the user still needs to paste it manually.
+            pass
         return
 
     # ------------------------------------------------------------------
     # Decide injection strategy
     # ------------------------------------------------------------------
-    import shutil
     is_wayland = (
         os.environ.get("XDG_SESSION_TYPE") == "wayland"
         or os.environ.get("WAYLAND_DISPLAY") is not None
@@ -742,7 +742,7 @@ def inject_text(text, transcription_duration=None):
                 [
                     ydotool_bin, "type",
                     "--key-delay", str(ms_per_char),
-                    "--", text + " ",
+                    "--", text,
                 ],
                 env=ydotool_env,
                 capture_output=True,
@@ -765,38 +765,14 @@ def inject_text(text, transcription_duration=None):
     # ------------------------------------------------------------------
     if not paste_success:
         is_kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "")
-        is_terminal = False   # skeleton – window detection disabled
+        is_terminal = is_active_window_terminal()
         use_ctrl_shift_v = False
         if is_terminal:
             shortcut = get_konsole_paste_shortcut()
             use_ctrl_shift_v = shortcut != "ctrl+v"
 
         if is_wayland:
-            # 1. wtype (non-KDE Wayland)
-            if not is_kde:
-                wtype_bin = shutil.which("wtype") or (
-                    os.path.expanduser("~/.local/bin/wtype")
-                    if os.path.exists(os.path.expanduser("~/.local/bin/wtype"))
-                    else None
-                )
-                if wtype_bin:
-                    try:
-                        time.sleep(0.40)
-                        paste_keys = (
-                            ["-M", "ctrl", "-M", "shift", "v", "-m", "shift", "-m", "ctrl"]
-                            if use_ctrl_shift_v
-                            else ["-M", "ctrl", "v", "-m", "ctrl"]
-                        )
-                        result = subprocess.run(
-                            [wtype_bin] + paste_keys, capture_output=True, text=True, timeout=3.0
-                        )
-                        if result.returncode == 0:
-                            print("[inject_text] wtype Paste succeeded")
-                            paste_success = True
-                    except Exception as exc:
-                        print(f"[inject_text] wtype Paste exception: {exc}", file=sys.stderr)
-
-            # 2. ydotool Ctrl+V (KDE/Wayland)
+            # ydotool Ctrl+V (KDE/Wayland)
             if not paste_success and ydotool_bin:
                 ydotool_env = os.environ.copy()
                 uid = os.getuid()
@@ -846,12 +822,13 @@ def inject_text(text, transcription_duration=None):
     if paste_success:
         # Transcription remains in clipboard unless the user explicitly
         # opted in to restoring the old clipboard content.
-        if restore_enabled and clipboard_ok:
-            old_clipboard = get_clipboard_content()   # already set to text
-            # Re-fetch original BEFORE we overwrote it – not available here,
-            # so we intentionally skip restore when restore_clipboard=false.
-            pass
-        logger.info("[inject_text] Injection complete. Transcription in clipboard.")
+        if restore_enabled and old_clipboard is not None:
+            # Give the system a tiny bit of time to register the paste before restoring
+            time.sleep(0.1)
+            set_clipboard_content(old_clipboard)
+            logger.info("[inject_text] Injection complete. Old clipboard content restored.")
+        else:
+            logger.info("[inject_text] Injection complete. Transcription in clipboard.")
     else:
         # Paste failed entirely: transcription is already safe in clipboard.
         logger.error("[inject_text] All paste methods failed. Transcription preserved in clipboard.")
